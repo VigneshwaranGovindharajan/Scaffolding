@@ -16,6 +16,8 @@ namespace Microsoft.DotNet.Tools.Scaffold.Services;
 /// </summary>
 internal class DotNetToolService : IDotNetToolService
 {
+    private const string DotNetScaffoldPackageName = "Microsoft.dotnet-scaffold";
+
     private readonly ILogger _logger;
     private readonly IEnvironmentService _environmentService;
     private readonly IFileSystem _fileSystem;
@@ -39,6 +41,7 @@ internal class DotNetToolService : IDotNetToolService
 
     /// <summary>
     /// Gets the list of commands provided by a specific .NET tool.
+    /// Built-in commands are queried from the running assembly.
     /// </summary>
     /// <param name="dotnetTool">The .NET tool information.</param>
     /// <param name="envVars">Optional environment variables.</param>
@@ -46,22 +49,48 @@ internal class DotNetToolService : IDotNetToolService
     public List<CommandInfo> GetCommands(DotNetToolInfo dotnetTool, IDictionary<string, string>? envVars = null)
     {
         List<CommandInfo>? commands = null;
-        var runner = dotnetTool.IsGlobalTool ?
-            DotnetCliRunner.Create(dotnetTool.Command, ["get-commands"], envVars) :
-            DotnetCliRunner.CreateDotNet(dotnetTool.Command, ["get-commands"], envVars);
-
-        var exitCode = runner.ExecuteAndCaptureOutput(out var stdOut, out _);
-        if (exitCode == 0 && !string.IsNullOrEmpty(stdOut))
+        DotnetCliRunner runner;
+        if (IsDotNetScaffoldTool(dotnetTool))
         {
-            try
-            {
-                string escapedJsonString = stdOut.Replace("\r", "").Replace("\n", "");
-                commands = JsonSerializer.Deserialize<List<CommandInfo>>(escapedJsonString);
-            }
-            catch (Exception)
-            {
-                // Ignore deserialization errors
-            }
+            // Preserve support for tools installed with --allow-roll-forward.
+            runner = DotnetCliRunner.CreateDotNet("exec", ["--roll-forward", "Major", typeof(DotNetToolService).Assembly.Location, "get-commands"], envVars);
+        }
+        else
+        {
+            runner = dotnetTool.IsGlobalTool ?
+                DotnetCliRunner.Create(dotnetTool.Command, ["get-commands"], envVars) :
+                DotnetCliRunner.CreateDotNet(dotnetTool.Command, ["get-commands"], envVars);
+        }
+
+        var exitCode = ExecuteAndCaptureOutput(runner, out var stdOut, out var stdErr);
+        if (exitCode != 0)
+        {
+            _logger.LogError(
+                "Command discovery failed for tool '{PackageName}' with exit code {ExitCode}.\nOutput: {Output}\nError: {Error}",
+                dotnetTool.PackageName, exitCode, stdOut, stdErr);
+            return [];
+        }
+
+        if (string.IsNullOrWhiteSpace(stdOut))
+        {
+            _logger.LogError("Command discovery returned no output for tool '{PackageName}'.\nError: {Error}", dotnetTool.PackageName, stdErr);
+            return [];
+        }
+
+        try
+        {
+            commands = JsonSerializer.Deserialize<List<CommandInfo>>(stdOut);
+        }
+        catch (JsonException ex)
+        {
+            _logger.LogError(ex, "Command discovery returned invalid JSON for tool '{PackageName}'.\nOutput: {Output}\nError: {Error}",
+                dotnetTool.PackageName, stdOut, stdErr);
+            return [];
+        }
+
+        if (commands is null)
+        {
+            _logger.LogError("Command discovery returned null instead of a command list for tool '{PackageName}'.", dotnetTool.PackageName);
         }
 
         return commands ?? [];
@@ -95,25 +124,27 @@ internal class DotNetToolService : IDotNetToolService
     }
 
     /// <summary>
-    /// Gets all commands from all .NET tools in parallel.
+    /// Gets all commands from the specified .NET tools in parallel.
     /// </summary>
-    /// <param name="components">Optional list of components to query. If null, all tools are queried.</param>
+    /// <param name="components">Optional list of components to query. If null or empty, the dotnet-scaffold tool is queried.</param>
     /// <param name="envVars">Optional environment variables.</param>
     /// <returns>List of key-value pairs of tool command and <see cref="CommandInfo"/>.</returns>
     public IList<KeyValuePair<string, CommandInfo>> GetAllCommandsParallel(IList<DotNetToolInfo>? components = null, IDictionary<string, string>? envVars = null)
     {
+        var restoreLocalTools = components is { Count: > 0 };
         if (components is null || components.Count == 0)
         {
-            components = GetDotNetTools(refresh: true, envVars);
+            components = GetDotNetTools(refresh: true, envVars)
+                .Where(IsDotNetScaffoldTool)
+                .ToList();
         }
 
-        //if any local tools are present, we need to restore them first
-        //when sdks/runtimes are switched/rolled forward, local tools need to be restored before they are called
-        var anyLocalTools = components.FirstOrDefault(x => !x.IsGlobalTool) is not null;
-        if (anyLocalTools)
+        // Explicitly supplied local tools may need to be restored when SDKs or runtimes change.
+        // Default discovery queries the running assembly, so the discovered installation need not be restored.
+        if (restoreLocalTools && components.Any(x => !x.IsGlobalTool))
         {
             var runner = DotnetCliRunner.CreateDotNet("tool", ["restore"], envVars);
-            runner.ExecuteAndCaptureOutput(out _, out _);
+            ExecuteAndCaptureOutput(runner, out _, out _);
         }
 
         var options = new ParallelOptions
@@ -136,6 +167,15 @@ internal class DotNetToolService : IDotNetToolService
 
         return commands.ToList();
     }
+
+    /// <summary>
+    /// Executes a tool discovery command and captures its output.
+    /// </summary>
+    protected virtual int ExecuteAndCaptureOutput(DotnetCliRunner runner, out string? stdOut, out string? stdErr)
+        => runner.ExecuteAndCaptureOutput(out stdOut, out stdErr);
+
+    private static bool IsDotNetScaffoldTool(DotNetToolInfo tool)
+        => tool.PackageName.Equals(DotNetScaffoldPackageName, StringComparison.OrdinalIgnoreCase);
 
     /// <summary>
     /// Installs a .NET tool using the dotnet CLI.
@@ -233,8 +273,8 @@ internal class DotNetToolService : IDotNetToolService
             var dotnetToolList = new List<DotNetToolInfo>();
             var runner = DotnetCliRunner.CreateDotNet("tool", ["list", "-g"], envVars);
             var localRunner = DotnetCliRunner.CreateDotNet("tool", ["list"], envVars);
-            var exitCode = runner.ExecuteAndCaptureOutput(out var stdOut, out _);
-            var localExitCode = localRunner.ExecuteAndCaptureOutput(out var localStdOut, out var localStdErr);
+            var exitCode = ExecuteAndCaptureOutput(runner, out var stdOut, out _);
+            var localExitCode = ExecuteAndCaptureOutput(localRunner, out var localStdOut, out var localStdErr);
             // Parse through local dotnet tools first.
             if (localExitCode == 0 && !string.IsNullOrEmpty(localStdOut))
             {
